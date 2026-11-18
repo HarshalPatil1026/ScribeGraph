@@ -1,0 +1,103 @@
+name: Generate article
+
+# Writes one article a day at 08:00 IST (02:30 UTC). On Sundays it writes the AI News
+# roundup instead. Add the GROQ_API_KEY repository secret to switch it on.
+
+on:
+  schedule:
+    - cron: "30 2 * * *"
+  workflow_dispatch:
+    inputs:
+      domain:
+        description: "Category ('auto' picks the one that has waited longest)"
+        type: choice
+        options: [auto, ml, dl, statistics, nlp, cv, genai, ainews]
+        default: auto
+      topic:
+        description: "Optional topic (needs a category other than auto)"
+        required: false
+        default: ""
+      dry_run:
+        description: "Dry run: no LLM calls, nothing published"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: generate-article
+  cancel-in-progress: false
+
+jobs:
+  generate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      llm__api_key: ${{ secrets.GROQ_API_KEY }}
+      llm__model_name: ${{ vars.GROQ_MODEL || 'openai/gpt-oss-120b' }}
+      r2__account_id: ${{ secrets.R2_ACCOUNT_ID }}
+      r2__access_key_id: ${{ secrets.R2_ACCESS_KEY_ID }}
+      r2__secret_access_key: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      r2__bucket_name: ${{ secrets.R2_BUCKET_NAME }}
+      content__tavily_api_key: ${{ secrets.TAVILY_API_KEY }}
+      content__guardian_api_key: ${{ secrets.GUARDIAN_API_KEY }}
+      OPIK_API_KEY: ${{ secrets.OPIK_API_KEY }}
+      OPIK_WORKSPACE: ${{ vars.OPIK_WORKSPACE }}
+      SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
+      DOMAIN_INPUT: ${{ inputs.domain }}
+      TOPIC_INPUT: ${{ inputs.topic }}
+      DRY_RUN_INPUT: ${{ inputs.dry_run }}
+    steps:
+      - name: Check configuration
+        id: config
+        run: |
+          if [ -z "$llm__api_key" ] && [ "$DRY_RUN_INPUT" != "true" ]; then
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::notice title=Article generation is off::Add a GROQ_API_KEY repository secret (Settings > Secrets and variables > Actions) to publish an article every day."
+          else
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@v7
+        if: steps.config.outputs.enabled == 'true'
+
+      - uses: astral-sh/setup-uv@v7
+        if: steps.config.outputs.enabled == 'true'
+        with:
+          enable-cache: true
+
+      - name: Install
+        if: steps.config.outputs.enabled == 'true'
+        run: |
+          extras=""
+          if [ -n "$OPIK_API_KEY" ]; then extras="--extra opik"; fi
+          uv sync --locked --no-dev $extras
+
+      - name: Generate
+        if: steps.config.outputs.enabled == 'true'
+        run: |
+          args=()
+          domain="${DOMAIN_INPUT:-auto}"
+          # Scheduled Sunday runs (IST) publish the AI News roundup.
+          if [ "${{ github.event_name }}" = "schedule" ] && [ "$(TZ=Asia/Kolkata date +%u)" = "7" ]; then
+            domain="ainews"
+          fi
+          if [ "$domain" != "auto" ]; then args+=(--domain "$domain"); fi
+          if [ -n "$TOPIC_INPUT" ] && [ "$domain" != "auto" ]; then args+=(--topic "$TOPIC_INPUT"); fi
+          if [ "$DRY_RUN_INPUT" = "true" ]; then args+=(--dry-run); fi
+          uv run --no-sync scribegraph "${args[@]}"
+
+      - name: Commit the new article (local storage)
+        if: steps.config.outputs.enabled == 'true' && inputs.dry_run != true
+        run: |
+          if [ -z "$(git status --porcelain -- scribegraph/web/blogs)" ]; then
+            echo "Nothing to commit (articles went to R2, or nothing changed)."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add scribegraph/web/blogs
+          git commit -m "content: new article for $(TZ=Asia/Kolkata date +%F)"
+          git pull --rebase --quiet
+          git push
